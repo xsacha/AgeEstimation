@@ -12,7 +12,12 @@ class FaceDataset(Dataset):
         self.labels = []
         for filepath in filepath_list:
             basename = os.path.basename(filepath)
-            self.labels.append(int(basename[4:6]))
+            if "A" in basename[4:6]:
+                self.labels.append(int(basename[6:8]))
+            elif "A" in basename[2:4]:
+                self.labels.append(int(basename[4:6]))
+            else:
+                self.labels.append(int(basename[0:2].replace("_","")))
             img = np.array(Image.open(filepath).convert('RGB'))
             self.images.append(img)
         self.images = np.array(self.images)

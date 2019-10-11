@@ -15,13 +15,14 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 from torchvision.models.resnet import resnet34
+from efficientnet_pytorch import EfficientNet
 from mean_variance_loss import MeanVarianceLoss
 import cv2
 
 LAMBDA_1 = 0.2
 LAMBDA_2 = 0.05
 START_AGE = 0
-END_AGE = 69
+END_AGE = 80
 VALIDATION_RATE= 0.1
 
 random.seed(2019)
@@ -31,12 +32,13 @@ torch.manual_seed(2019)
 
 def ResNet34(num_classes):
 
-    model = resnet34(pretrained=True)
-    model.fc = nn.Sequential(
-        nn.BatchNorm1d(512),
-        nn.Dropout(0.5),
-        nn.Linear(512, num_classes),
-    )
+    model = EfficientNet.from_pretrained('efficientnet-b0', num_classes=num_classes)
+    #model = resnet34(pretrained=True)
+    #model.fc = nn.Sequential(
+    #    nn.BatchNorm1d(512),
+    #    nn.Dropout(0.5),
+    #    nn.Linear(512, num_classes),
+    #)
     return model
 
 
@@ -122,10 +124,8 @@ def test(test_loader, model):
             image = sample['image'].cuda()
             label = sample['label'].cuda()
             output = model(image)
-            m = nn.Softmax(dim=1)
-            output = m(output)
             a = torch.arange(START_AGE, END_AGE + 1, dtype=torch.float32).cuda()
-            mean = (output * a).sum(1, keepdim=True).cpu().data.numpy()
+            mean = (output.softmax(1) * a).sum(1, keepdim=True).cpu().data.numpy()
             pred = np.around(mean)
             mae += np.absolute(pred - sample['label'].cpu().data.numpy())
     return mae / len(test_loader)
@@ -139,10 +139,9 @@ def predict(model, image):
         image = np.transpose(image, (2,0,1))
         img = torch.from_numpy(image).cuda()
         output = model(img[None])
-        m = nn.Softmax(dim=1)
-        output = m(output)
+        torch.jit.trace(model, img[None]).save('age.pt')
         a = torch.arange(START_AGE, END_AGE + 1, dtype=torch.float32).cuda()
-        mean = (output * a).sum(1, keepdim=True).cpu().data.numpy()
+        mean = (output.softmax(1) * a).sum(1, keepdim=True).cpu().data.numpy()
         pred = np.around(mean)[0][0]
     return pred
 
@@ -153,7 +152,7 @@ def get_image_list(image_directory, leave_sub, validation_rate):
     test_list = []
     for fn in os.listdir(image_directory):
         filepath = os.path.join(image_directory, fn)
-        subject = int(fn[:3])
+        subject = int(random.randint(0,100)) #fn[:6].partition("A")[0]
         if subject == leave_sub:
             test_list.append(filepath)
         else:
@@ -197,14 +196,15 @@ def main():
 
         train_filepath_list, val_filepath_list, test_filepath_list\
             = get_image_list(args.image_directory, args.leave_subject, VALIDATION_RATE)
+        # We crop 12.5% or 28 pixels off a 224 image
         transforms_train = torchvision.transforms.Compose([
             torchvision.transforms.ToPILImage(),
+            torchvision.transforms.Resize((224, 224)),
             torchvision.transforms.RandomApply(
-                [torchvision.transforms.RandomAffine(degrees=10, shear=16),
+                [
                  torchvision.transforms.RandomHorizontalFlip(p=1.0),
                 ], p=0.5),
-            torchvision.transforms.Resize((256, 256)),
-            torchvision.transforms.RandomCrop((224, 224)),
+            torchvision.transforms.RandomCrop((196, 196)),
             torchvision.transforms.ToTensor()
         ])
         train_gen = FaceDataset(train_filepath_list, transforms_train)
@@ -213,6 +213,7 @@ def main():
         transforms = torchvision.transforms.Compose([
             torchvision.transforms.ToPILImage(),
             torchvision.transforms.Resize((224, 224)),
+            torchvision.transforms.CenterCrop((196)),
             torchvision.transforms.ToTensor()
         ])
         val_gen = FaceDataset(val_filepath_list, transforms)
@@ -222,19 +223,21 @@ def main():
         test_loader = DataLoader(test_gen, batch_size=1, shuffle=False, pin_memory=True, num_workers=8)
 
         model = ResNet34(END_AGE - START_AGE + 1)
+        if args.resume is not None:
+            model.load_state_dict(torch.load(args.resume))
         model.cuda()
 
-        optimizer = optim.SGD(model.parameters(), lr = args.learning_rate, momentum=0.9, weight_decay=1e-4)
+        optimizer = optim.Adam(model.parameters(), lr = args.learning_rate, weight_decay=1e-4)
         criterion1 = MeanVarianceLoss(LAMBDA_2, LAMBDA_1, START_AGE, END_AGE).cuda()
         criterion2 = torch.nn.CrossEntropyLoss().cuda()
 
         # scheduler = lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
-        scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[40, 60], gamma=0.1)
+        scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 90], gamma=0.1)
 
-        for param in model.parameters():
-            param.requires_grad = False
-        for param in model.fc.parameters():
-            param.requires_grad = True
+        #for param in model.parameters():
+        #    param.requires_grad = False
+        #for param in model.fc.parameters():
+        #    param.requires_grad = True
 
         best_val_mae = np.inf
         best_val_loss = np.inf
@@ -244,8 +247,8 @@ def main():
             if epoch == 10:
                 for param in model.parameters():
                     param.requires_grad = True
-            scheduler.step(epoch)
             train(train_loader, model, criterion1, criterion2, optimizer, epoch, args.result_directory)
+            scheduler.step(epoch)
             mean_loss, variance_loss, softmax_loss, loss_val, mae = evaluate(val_loader, model, criterion1, criterion2)
             mae_test = test(test_loader, model)
             print('epoch: %d, mean_loss: %.3f, variance_loss: %.3f, softmax_loss: %.3f, loss: %.3f, mae: %3f' %
@@ -271,14 +274,17 @@ def main():
     if args.pred_image and args.pred_model:
         model = ResNet34(END_AGE - START_AGE + 1)
         model.cuda()
-        img = cv2.imread(args.pred_image)
-        resized_img = cv2.resize(img, (224, 224))
-        model.load_state_dict(torch.load(args.pred_model))
-        pred = predict(model, resized_img)
-        print('Age: ' + str(int(pred)))
-        cv2.putText(img, 'Age: ' + str(int(pred)), (int(img.shape[1]*0.1), int(img.shape[0]*0.9)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-        name, ext = os.path.splitext(args.pred_image)
-        cv2.imwrite(name + '_result.jpg', img)
+        from pathlib import Path
+        file_list = [f for f in Path(args.pred_image).glob('*.webp') if f.is_file()]
+        for f in file_list:
+            img = cv2.imread(str(f))
+            resized_img = cv2.resize(img, (224, 224))[14:14 + 196, 14:14 + 196]
+            model.load_state_dict(torch.load(args.pred_model))
+            pred = predict(model, resized_img)
+            print('Image: ' + str(f) + ' Age: ' + str(int(pred)))
+            #cv2.putText(resized_img, 'Age: ' + str(int(pred)), (int(resized_img.shape[1]*0.1), int(resized_img.shape[0]*0.9)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            #name, ext = os.path.splitext(args.pred_image)
+            #cv2.imwrite(name + '_result.jpg', resized_img)
         
 if __name__ == "__main__":
     main()
